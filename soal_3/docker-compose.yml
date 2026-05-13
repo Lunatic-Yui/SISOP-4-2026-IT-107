@@ -1,0 +1,56 @@
+services:
+  libraryit:
+    build: .
+    container_name: libraryit-server
+    ports:
+      - "1445:445"
+      - "1139:139"
+    volumes:
+      - ./data:/libraryit
+      - shared_logs:/var/log/samba
+    restart: unless-stopped
+
+  libraryit-logger:
+    image: debian:latest
+    container_name: libraryit-logger
+    volumes:
+      - shared_logs:/var/log/samba
+    depends_on:
+      - libraryit
+    command:
+      - /bin/bash
+      - -c
+      - |
+        tail -F /var/log/samba/raw.log | while read -r line; do
+          if [[ "$$line" == *"AUDIT|"* ]]; then
+            data="$${line#*AUDIT|}"
+            IFS='|' read -r user share op status file <<< "$$data"
+            if [[ "$$status" == *"fail"* ]]; then
+              lvl="WARNING"
+              act="DENIED"
+              target="$$share"
+            else
+              lvl="INFO"
+              if [ "$$op" = "connect" ]; then 
+                act="CONNECT"
+                target="$$share"
+              elif [ "$$op" = "pwrite" ]; then 
+                act="WRITE"
+                target="$${file##*/}"
+              else 
+                act="$$op"
+                target="$$file"
+              fi
+            fi
+            dt=$$(date '+%Y-%m-%d %H:%M:%S')
+            
+            # SIMPAN LANGSUNG KE FILE libraryit.log
+            echo "[$$dt] [$$lvl] [$$user] [$$act] [$$target]" >> /var/log/samba/libraryit.log
+            
+            # Tampilkan juga di terminal (optional, biar gampang dipantau)
+            echo "[$$dt] [$$lvl] [$$user] [$$act] [$$target]"
+          fi
+        done
+
+volumes:
+  shared_logs:
