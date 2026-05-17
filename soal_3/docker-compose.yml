@@ -7,20 +7,24 @@ services:
       - "1139:139"
     volumes:
       - ./data:/libraryit
-      - shared_logs:/var/log/samba
+      - shared_logs:/var/log/samba   
     restart: unless-stopped
 
   libraryit-logger:
     image: debian:latest
     container_name: libraryit-logger
     volumes:
-      - shared_logs:/var/log/samba
+      - shared_logs:/var/log/samba   
+      - ./logs:/app/logs            
     depends_on:
       - libraryit
     command:
       - /bin/bash
       - -c
       - |
+        # Bikin foldernya kalau belum ada
+        mkdir -p /app/logs
+        
         tail -F /var/log/samba/raw.log | while read -r line; do
           if [[ "$$line" == *"AUDIT|"* ]]; then
             data="$${line#*AUDIT|}"
@@ -44,10 +48,8 @@ services:
             fi
             dt=$$(date '+%Y-%m-%d %H:%M:%S')
             
-            # SIMPAN LANGSUNG KE FILE libraryit.log
-            echo "[$$dt] [$$lvl] [$$user] [$$act] [$$target]" >> /var/log/samba/libraryit.log
-            
-            # Tampilkan juga di terminal (optional, biar gampang dipantau)
+            # SIMPAN KE FOLDER BARU (/app/logs) YANG NYAMBUNG KE FOLDER ./logs DI HOST
+            echo "[$$dt] [$$lvl] [$$user] [$$act] [$$target]" >> /app/logs/libraryit.log
             echo "[$$dt] [$$lvl] [$$user] [$$act] [$$target]"
           fi
         done
