@@ -1036,25 +1036,329 @@ Jika dalam video no 2 itu tidak bisa automatic bikin foldernya, itu salah saya s
 
 #### Penjelasan
 
-**<nama-file>.<format-file>**
+**Dockerfile**
 
-Apa aja deh bebas wokk. Sesuaikan format dengan file yang dibutuhkan dengan soal juga
+Pertama-tama membuat file Dockerfilenya terlebih dahulu
 
-```<kode-program>
+```Dockerfile
+FROM ubuntu:latest
 
-<!-- Kode programnya -->
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y samba && apt-get clean
+
+WORKDIR /app
+
+COPY . /app/
+
+RUN cp /app/smb.conf /etc/samba/smb.conf
+
+ENTRYPOINT ["/bin/bash", "/app/entrypoint.sh"]
+```
+
+Nah dalam kode ini ada beberapa: `FROM` untuk mendefinisikan sistem sandbox, `ENV` sebagai environtment yang user tuju, `RUN apt get-update...` untuk menjalankan programnya yang dijalankan, `WORKDIR` tempat direktori bekerja, `COPY . /app/` untuk mengcopy semua file ke dalam `/app/`, `RUN cp /app/smb.conf ...` untuk menjalankan programnya dengan mengcopy, dan `ENTRYPOINT` buat menjalankan file-filenya. Selanjutnya
+
+**smb.conf**
+
+```conf
+[global]
+    workgroup = WORKGROUP
+    server string = LibraryIT Server
+    security = user
+    map to guest = bad user
+    dns proxy = no
+
+    vfs objects = full_audit
+    full_audit:prefix = AUDIT|%u|%S
+    full_audit:success = connect pwrite
+    full_audit:failure = connect pwrite
+    full_audit:facility = local7
+    full_audit:priority = notice
+```
+
+Untuk configurasi awalnya secara global. Selanjutnya
+
+```conf
+[ebooks]
+    path = /libraryit/ebooks
+    browseable = yes
+    guest ok = yes
+    read only = no
+
+[papers]
+    path = /libraryit/papers
+    browseable = yes
+    guest ok = yes
+    read only = no
+
+[docs]
+    path = /libraryit/docs
+    browseable = yes
+    guest ok = yes
+    read only = no
+    force user = root
+
+[SourceCode]
+    path = /libraryit/sourcecode
+    browseable = no
+    valid users = @staff
+    read only = no
+```
+
+adalah configurasi untuk masing-masing user dengan permissionnya. Kemudian file:
+
+**entrypoint.sh**
+
+Untuk kode programnya:
+
+```sh
+if ! command -v rsyslogd &> /dev/null; then
+    apt-get update && apt-get install -y rsyslog samba-vfs-modules
+fi
+```
+
+adalah awal pengecekan pada lingkungan docker container ini. Nantinya `rsyslog` sendiri sebagai tempat penyimpanan virtual tanpa memunculkan errornya di terminal. Selanjutnya:
+
+```sh
+mkdir -p /var/log/samba
+touch /var/log/samba/raw.log
+touch /var/log/samba/libraryit.log
+chmod 777 /var/log/samba/raw.log /var/log/samba/libraryit.log
+
+echo "local7.* /var/log/samba/raw.log" > /etc/rsyslog.d/samba-audit.conf
+service rsyslog restart
+
+mkdir -p /libraryit/ebooks /libraryit/papers /libraryit/sourcecode /libraryit/docs
+```
+
+adalah command-command setupun yang dibutuhkan sebelum dipakai oleh user seperti menyiadakan tempat folder ebooks, papers, dkk. Dan juga menyiapkan untuk logs sebagai pencatat untuk `docker logs` nantinya. Selanjutnya
+
+```sh
+userdel $(id -un 1000) 2>/dev/null
+groupdel $(getent group 50 | cut -d: -f1) 2>/dev/null
+groupdel $(getent group 100 | cut -d: -f1) 2>/dev/null
+
+groupadd -g 50 staff
+groupadd -g 100 readonly
+
+useradd -M -u 1000 -s /sbin/nologin -c "" member
+(echo "member123"; echo "member123") | smbpasswd -a -s member
+
+useradd -M -u 1001 -s /sbin/nologin -c "" contributor
+(echo "contrib456"; echo "contrib456") | smbpasswd -a -s contributor
+
+useradd -M -u 1002 -s /sbin/nologin -c "" librarian
+(echo "lib789"; echo "lib789") | smbpasswd -a -s librarian
+
+usermod -aG staff librarian
+usermod -aG staff contributor
+usermod -aG readonly member
+
+chown -R root:staff /libraryit
+chmod 775 /libraryit/ebooks /libraryit/papers /libraryit/docs
+chmod 750 /libraryit/sourcecode
+
+smbd -F -d 2
+```
+
+adalah program untuk menentukan identitas user beserta password dan permissionnya. Nah dalam program ini dikelompokkan ke beberapa seperti member ke kelompok member, contributor ke kelompok contributor, dan librarian ke kelompok librarian. Nah masing-masing kelompok ini mempunyai passwordnya sendiri dan permissionnya sendiri. Selanjutnya file:
+
+**docker-compose.yml**
+
+```yml
+services:
+  libraryit:
+    build: .
+    container_name: libraryit-server
+    ports:
+      - "1445:445"
+      - "1139:139"
+    volumes:
+      - ./data:/libraryit
+      - shared_logs:/var/log/samba
+    restart: unless-stopped
+
+  libraryit-logger:
+    image: debian:latest
+    container_name: libraryit-logger
+    volumes:
+      - shared_logs:/var/log/samba
+    depends_on:
+      - libraryit
+    command:
+      - /bin/bash
+      - -c
+      - |
+        tail -F /var/log/samba/raw.log | while read -r line; do
+          if [[ "$$line" == *"AUDIT|"* ]]; then
+            data="$${line#*AUDIT|}"
+            IFS='|' read -r user share op status file <<< "$$data"
+            if [[ "$$status" == *"fail"* ]]; then
+              lvl="WARNING"
+              act="DENIED"
+              target="$$share"
+            else
+              lvl="INFO"
+              if [ "$$op" = "connect" ]; then 
+                act="CONNECT"
+                target="$$share"
+              elif [ "$$op" = "pwrite" ]; then 
+                act="WRITE"
+                target="$${file##*/}"
+              else 
+                act="$$op"
+                target="$$file"
+              fi
+            fi
+            dt=$$(date '+%Y-%m-%d %H:%M:%S')
+            
+            echo "[$$dt] [$$lvl] [$$user] [$$act] [$$target]" >> /var/log/samba/libraryit.log
+            echo "[$$dt] [$$lvl] [$$user] [$$act] [$$target]"
+          fi
+        done
+
+volumes:
+  shared_logs:
+```
+
+adalah kode yang menyalakan program dengan attach ke `Dockerfilenya` sekaligus mencatatnya ke lognya ketika user menggunakan command `Docker logs -f libraryit-logger`. Namun ada kode yang diperbaikin dan versi diperbaikinnya:
+
+```yml
+services:
+  libraryit:
+    build: .
+    container_name: libraryit-server
+    ports:
+      - "1445:445"
+      - "1139:139"
+    volumes:
+      - ./data:/libraryit
+      - shared_logs:/var/log/samba   
+    restart: unless-stopped
+
+  libraryit-logger:
+    image: debian:latest
+    container_name: libraryit-logger
+    volumes:
+      - shared_logs:/var/log/samba   
+      - ./logs:/app/logs            
+    depends_on:
+      - libraryit
+    command:
+      - /bin/bash
+      - -c
+      - |
+        mkdir -p /app/logs
+        
+        tail -F /var/log/samba/raw.log | while read -r line; do
+          if [[ "$$line" == *"AUDIT|"* ]]; then
+            data="$${line#*AUDIT|}"
+            IFS='|' read -r user share op status file <<< "$$data"
+            if [[ "$$status" == *"fail"* ]]; then
+              lvl="WARNING"
+              act="DENIED"
+              target="$$share"
+            else
+              lvl="INFO"
+              if [ "$$op" = "connect" ]; then 
+                act="CONNECT"
+                target="$$share"
+              elif [ "$$op" = "pwrite" ]; then 
+                act="WRITE"
+                target="$${file##*/}"
+              else 
+                act="$$op"
+                target="$$file"
+              fi
+            fi
+            dt=$$(date '+%Y-%m-%d %H:%M:%S')
+            
+            echo "[$$dt] [$$lvl] [$$user] [$$act] [$$target]" >> /app/logs/libraryit.log
+            echo "[$$dt] [$$lvl] [$$user] [$$act] [$$target]"
+          fi
+        done
+
+volumes:
+  shared_logs:
+```
+
+#### Higlight problem
+
+Nah karena yang saya kumpulkan versi pertamanya jadi saya mau higlight beberapa kesalahannya (kesalahan yang dimaksud: tidak muncul text dalam log).
+
+1. Volume hanya 1
+
+```yml
+volumes:
+      - shared_logs:/var/log/samba
+```
+
+Nah dalam program docker-compose ini hanya terdapat 1 perintah menyimpan lognya yaitu `log/samba` saja. Kalau hanya 1, berarti semua isi log akan tersimpan dalam `log/samba` saja.
+
+2. Tidak ada perintah `mkdir`
+
+Nah kesalah kedua tidak membuat perintah `mkdir` pada command di docker command karena `mkdir` sendiri adalah `make directory` yang artinya membuat folder itu sendiri. 
+
+3. Pembuangan `echo` ke `log/samba` bukan `logs/libraryit.log`
+
+Programnya:
+
+```yml
+echo "[$$dt] [$$lvl] [$$user] [$$act] [$$target]" >> /var/log/samba/libraryit.log
+```
+
+Jadi pada perintah ini hanya terbuang pada root `var` dan lognya tersimpan dalam var itu. Akibatnya `libraryit.log` tidak muncul dalam `logs` yang user tempat sekarang. 
+
+#### perbaikan
+
+Untuk perbaikannya:
+
+1. Menambahkan volume terpisah `logs` programnya:
+
+```yml
+    volumes:
+      - shared_logs:/var/log/samba   
+      - ./logs:/app/logs # -> add this one on the volumes karena pertama gk ada.
+```
+
+2. Menambahkan command `mkdir`, progamnya
+
+```yml
+command:
+      - /bin/bash
+      - -c
+      - |
+        mkdir -p /app/logs # -> command buat nambahkan directory
+```
+
+3. Menargetkan ke `/app/logs` bukan ke `var`. Kodenya:
+
+```yml
+echo "[$$dt] [$$lvl] [$$user] [$$act] [$$target]" >> /app/logs/libraryit.log
 ```
 
 #### output
 
-<!-- <isinya gambar dari hasil yang sesuai> -->
+1. Docker compose up
 
-contoh:
+![alt text](/assets/soal_3/compose%20up.png)
 
-1. Rua rua
+2. Result identity dan result yang lain
 
-`![alt text](<source-nya>)`
+![alt text](/assets/soal_3/identity%20and%20result.png)
+
+3. Testing permission
+
+![alt text](/assets/soal_3/testing-perm.png)
+
+4. Output yang lain untuk testing
+
+![alt text](/assets/soal_3/output%20lain.png)
+
+5. Hasil log dari semua kegiatan yang dilakukan
+
+![alt text](/assets/soal_3/Hasil%20log.png)
 
 #### Kendala
 
-<!-- Isi kendalanya dimana -->
+Tidak muncul isi logsnya. Perbaikannya sudah sebelum section `output`. Sisanya tidak ada.
