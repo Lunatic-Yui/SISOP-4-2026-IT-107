@@ -1,16 +1,14 @@
 #!/bin/bash
 
-if ! command -v rsyslogd &> /dev/null; then
-    apt-get update && apt-get install -y rsyslog samba-vfs-modules
-fi
-
+# Setup File Log
 mkdir -p /var/log/samba
 touch /var/log/samba/raw.log
 touch /var/log/samba/libraryit.log
 chmod 777 /var/log/samba/raw.log /var/log/samba/libraryit.log
 
 echo "local7.* /var/log/samba/raw.log" > /etc/rsyslog.d/samba-audit.conf
-service rsyslog restart
+
+rsyslogd
 
 mkdir -p /libraryit/ebooks /libraryit/papers /libraryit/sourcecode /libraryit/docs
 

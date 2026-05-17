@@ -2,7 +2,7 @@ FROM ubuntu:latest
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y samba && apt-get clean
+RUN apt-get update && apt-get install -y samba rsyslog samba-vfs-modules smbclient && apt-get clean
 
 WORKDIR /app
 
