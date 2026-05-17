@@ -595,3 +595,466 @@ adlaah fungsi yang dimana dia akan memutus koneksi ketika server tidak terhubung
 #### Kendala
 
 Tidak ada kendala
+
+### Soal 2
+
+#### Penjelasan
+
+**server** dan **notes.csv.enc**
+
+Diberikan link gdrive dan setelah dicheck, ada 2 file dalam gdrive itu. Saya menggunakan `gdown` untuk mendownload kedua file itu. Selanjutnya
+
+**fuse.c**
+
+Membuat fuse.c. Kode programnya seperti ini:
+
+```c
+
+#define FUSE_USE_VERSION 28
+#include <fuse.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <errno.h>
+#include <sys/time.h>
+#include <sys/stat.h>
+#include <stdlib.h>
+
+static char source_dir[1024];
+
+#define XOR_KEY 0x76
+```
+
+adalah kode untuk setupan awalnya dengan mendefinisikan `XOR_KEY 0x76` dan kalau diartikan dalam 0x76 sendiri adalah 118. Dan juga terdapat source_dir yang memiliki batasnya adalah 1024 dengan library yang dibutuhkan. Selanjutnya
+
+```c
+static void xor_crypt(char *buf, size_t size) {
+    for (size_t i = 0; i < size; i++) {
+        buf[i] ^= XOR_KEY;
+    }
+}
+```
+
+adalah kode untuk membuat enkripsi dengan key `XOR_KEY` yang sudah di definisikan atau sudah di set. Selanjutnya
+
+```c
+static void get_dir_path(char *res, const char *path) {
+    sprintf(res, "%s%s", source_dir, path);
+}
+
+static void get_file_path(char *res, const char *path) {
+    sprintf(res, "%s%s.enc", source_dir, path);
+}
+```
+
+Dalam kode ini, terdapat dua fungsi pendukung (helper functions) yang bertugas melakukan pemetaan alamat (path mapping) dari sistem berkas virtual ke lokasi penyimpanan fisik menggunakan fungsi manipulasi string `sprintf`.
+
+Pertama, fungsi `get_dir_path` digunakan untuk memetakan path direktori dengan menggabungkan string dari direktori sumber (`source_dir`) dan path yang direquest (path) tanpa modifikasi tambahan.
+
+Kedua, fungsi `get_file_path` digunakan secara spesifik untuk memetakan path dari sebuah file. Berbeda dengan direktori, fungsi ini secara otomatis menyisipkan ekstensi `.enc` di akhir path yang direquest. Hal ini dilakukan karena file secara fisik disimpan dalam format terenkripsi dengan ekstensi `.enc` di dalam direktori sumber, namun ditampilkan seolah-olah sebagai file normal tanpa ekstensi tersebut pada direktori mount (virtual point). Selanjutnya
+
+```c
+static int xmp_getattr(const char *path, struct stat *stbuf) {
+    char fpath[1024];
+    
+    get_dir_path(fpath, path);
+    if (lstat(fpath, stbuf) == 0) return 0;
+
+    get_file_path(fpath, path);
+    if (lstat(fpath, stbuf) == 0) return 0;
+
+    return -ENOENT; 
+}
+```
+
+Fungsi `xmp_getattr` bertugas untuk mengambil dan mengembalikan metadata dari sebuah file atau direktori. Pada implementasi ini, fungsi diatur untuk melakukan pengecekan ganda (dual-check) menggunakan system call `lstat` untuk mengatasi perbedaan penamaan antara virtual path dan physical path.
+
+Pertama, program akan mengasumsikan path yang diminta sebagai direktori dan memetakan path-nya menggunakan `get_dir_path`. Jika `lstat` mengembalikan nilai keberhasilan (0), atribut akan langsung diteruskan. Jika gagal, program akan mengasumsikan path tersebut sebagai sebuah file dan memetakannya ulang menggunakan `get_file_path` (yang menyisipkan ekstensi `.enc`), kemudian kembali melakukan pengecekan dengan `lstat`. Apabila kedua tahap validasi ini gagal, fungsi akan mengembalikan error `-ENOENT` yang menandakan bahwa file atau direktori tersebut memang tidak eksis di dalam penyimpanan fisik. Selanjutnya
+
+```c
+static int xmp_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
+    char fpath[1024];
+    get_dir_path(fpath, path);
+
+    DIR *dp = opendir(fpath);
+    if (dp == NULL) return -errno;
+
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        char name[256];
+        strcpy(name, de->d_name);
+
+        if (de->d_type == DT_REG || de->d_type == DT_UNKNOWN) {
+            size_t len = strlen(name);
+            if (len > 4 && strcmp(name + len - 4, ".enc") == 0) {
+                name[len - 4] = '\0';
+            }
+        }
+
+        struct stat st;
+        memset(&st, 0, sizeof(st));
+        st.st_ino = de->d_ino;
+        st.st_mode = de->d_type << 12;
+        filler(buf, name, &st, 0);
+    }
+    closedir(dp);
+    return 0;
+}
+```
+
+Nah dalam kode ini, fungsi `xmp_readdir` bertugas untuk membaca dan menampilkan isi dari sebuah direktori (directory listing). Pada implementasi sistem berkas terenkripsi ini, fungsi `readdir` dimodifikasi untuk menyembunyikan ekstensi file fisik (`.enc`) dari antarmuka pengguna.
+
+Program melakukan iterasi menggunakan `readdir` dan memfilter entri yang berupa file reguler (`DT_REG`). Pada file-file tersebut, dilakukan pengecekan panjang karakter dan pencocokan substring `".enc"` di akhir nama file menggunakan `strcmp`. Jika cocok, program memanipulasi string dengan menyisipkan karakter null terminator (`'\0'`) pada indeks ke `len - 4`. Teknik ini secara efektif memotong ekstensi `.enc` sebelum nama file diteruskan ke buffer FUSE menggunakan fungsi `filler`, sehingga pengguna hanya melihat nama file dengan ekstensi aslinya (contoh: `file.txt.enc` akan dirender sebagai `file.txt`). Kemudian
+
+```c
+static int xmp_mkdir(const char *path, mode_t mode) {
+    char fpath[1024];
+    get_dir_path(fpath, path);
+    int res = mkdir(fpath, mode);
+    if (res == -1) return -errno;
+    return 0;
+}
+
+static int xmp_rmdir(const char *path) {
+    char fpath[1024];
+    get_dir_path(fpath, path);
+    int res = rmdir(fpath);
+    if (res == -1) return -errno;
+    return 0;
+}
+```
+
+adalah 2 kode yang mempunyai fungsi fundamental dalam manajemen direktori pada sistem berkas FUSE, yang masing-masing bertugas untuk membuat dan menghapus direktori kosong.
+
+Kedua fungsi ini beroperasi menggunakan mekanisme passthrough murni. Karena skenario enkripsi ekstensi `.enc` hanya berlaku untuk file, kedua fungsi ini menggunakan helper `get_dir_path` untuk memetakan path virtual menjadi path fisik tanpa memodifikasi nama direktori. Setelah path fisik diperoleh, eksekusi operasi didelegasikan sepenuhnya kepada system call POSIX standar, yaitu `mkdir()` (dengan menyertakan parameter `mode` untuk permission atau Access Control List) dan `rmdir()`. Apabila terjadi penolakan atau kegagalan pada level sistem operasi (seperti direktori tidak kosong saat dihapus), fungsi akan meneruskan kode error bawaan sistem (`-errno`) kembali ke antarmuka pengguna FUSE.
+
+```c
+static int xmp_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
+    char fpath[1024];
+    get_file_path(fpath, path); 
+    int res = creat(fpath, mode);
+    if (res == -1) return -errno;
+    fi->fh = res;
+    return 0;
+}
+
+static int xmp_open(const char *path, struct fuse_file_info *fi) {
+    char fpath[1024];
+    get_file_path(fpath, path);
+    int res = open(fpath, fi->flags);
+    if (res == -1) return -errno;
+    close(res);
+    return 0;
+}
+```
+
+Merupakan dua kode krusial yang mengontrol gerbang akses direktori virtual, baik untuk inisiasi file baru maupun pembukaan file yang sudah ada. Mengingat objek yang ditangani pada tahap ini adalah sebuah file, kedua rutinitas ini mengawali prosedurnya dengan memanggil helper `get_file_path` guna memastikan ekstensi `.enc` tersisip dengan benar pada path fisik tujuan.
+
+Meskipun memiliki mekanisme resolusi alamat yang sama, perlakuan terhadap file descriptor (ID referensi file) pada kedua fungsi ini memiliki perbedaan fundamental. Saat pengguna membuat file baru, rutinitas `xmp_create` mendelegasikan eksekusinya pada system call `creat()` dan secara persisten menyimpan file descriptor yang dihasilkan ke dalam struktur FUSE (`fi->fh`). Penyimpanan ini sangat krusial agar operasi penulisan (write) yang menyusul tidak kehilangan jejak file fisiknya. Sebaliknya, saat pengguna mengakses file yang sudah eksis, rutinitas `xmp_open` sekadar menguji hak akses melalui system call `open()` sesuai flags yang diminta sistem. Uniknya, apabila akses diizinkan, file descriptor tersebut justru seketika dilepaskan kembali melalui perintah `close()`. Pendekatan ini diterapkan karena pada arsitektur program ini, rutin pembukaan file difungsikan murni sebagai mekanisme validasi izin akses (permission check) sebelum sistem operasi benar-benar mengeksekusi proses pembacaan atau penulisan data di tahap selanjutnya. Lalu
+
+```c
+
+static int xmp_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+    char fpath[1024];
+    get_file_path(fpath, path);
+    int fd = open(fpath, O_RDONLY);
+    if (fd == -1) return -errno;
+
+    int res = pread(fd, buf, size, offset);
+    if (res > 0) xor_crypt(buf, res); 
+
+    close(fd);
+    if (res == -1) return -errno;
+    return res;
+}
+
+static int xmp_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+    char fpath[1024];
+    get_file_path(fpath, path);
+    int fd = open(fpath, O_WRONLY);
+    if (fd == -1) return -errno;
+
+    char *enc_buf = malloc(size);
+    memcpy(enc_buf, buf, size);
+    xor_crypt(enc_buf, size); 
+
+    int res = pwrite(fd, enc_buf, size, offset);
+    free(enc_buf);
+    close(fd);
+    if (res == -1) return -errno;
+    return res;
+}
+```
+
+Merupakan dua operasi utama pengelola lalu lintas data I/O yang mengawali prosedurnya dengan menyisipkan ekstensi `.enc` melalui rutinitas `get_file_path`. Pada operasi pembacaan (`xmp_read`), data mentah ditarik menggunakan system call `pread`, lalu seketika didekripsi di dalam buffer menggunakan fungsi `xor_crypt` secara on-the-fly sebelum ditampilkan ke pengguna. Sebaliknya, operasi penulisan (`xmp_write`) memerlukan manajemen memori khusus karena buffer input dari sistem bersifat read-only. Oleh karena itu, program mengalokasikan ruang memori sementara secara dinamis menggunakan `malloc` untuk menyalin dan mengenkripsi data sebelum dituliskan secara fisik melalui `pwrite`. Memori sementara ini kemudian wajib dibebaskan menggunakan perintah `free` guna mencegah terjadinya kebocoran memori (memory leak). Lalu
+
+```c
+
+static int xmp_truncate(const char *path, off_t size) {
+    char fpath[1024];
+    get_file_path(fpath, path);
+    int res = truncate(fpath, size);
+    if (res == -1) return -errno;
+    return 0;
+}
+
+static int xmp_unlink(const char *path) {
+    char fpath[1024];
+    get_file_path(fpath, path);
+    int res = unlink(fpath);
+    if (res == -1) return -errno;
+    return 0;
+}
+
+static int xmp_access(const char *path, int mask) {
+    char fpath[1024];
+    get_dir_path(fpath, path);
+    if (access(fpath, mask) == 0) return 0;
+
+    get_file_path(fpath, path);
+    if (access(fpath, mask) == 0) return 0;
+
+    return -ENOENT;
+}
+```
+
+Nah pada ketiga program ini melengkapi fungsionalitas manajemen entitas dasar melalui pendelegasian langsung ke system call POSIX. Operasi pemotongan ukuran file (`xmp_truncate`) dan penghapusan file (`xmp_unlink`) secara spesifik menargetkan file fisik, sehingga keduanya menggunakan rutin `get_file_path` untuk menyisipkan ekstensi `.enc` sebelum mengeksekusi fungsi bawaan `truncate()` dan `unlink()`. Sementara itu, operasi `xmp_access` yang bertugas memvalidasi izin akses pengguna (seperti izin baca atau tulis) harus menerapkan mekanisme pengecekan ganda (dual-check fallback) layaknya operasi pengambilan atribut. Hal ini dikarenakan sistem harus menguji eksistensi dan hak akses target sebagai sebuah direktori terlebih dahulu melalui `get_dir_path`. Apabila uji pertama tersebut gagal, sistem akan berasumsi bahwa targetnya adalah sebuah file dan kembali melakukan validasi dengan menyisipkan ekstensi `.enc` melalui `get_file_path`, sebelum akhirnya mengembalikan error `-ENOENT` jika kedua validasi tersebut tidak membuahkan hasil. Kemudian
+
+```c
+static int xmp_rename(const char *from, const char *to) {
+    char ffrom[1024], fto[1024];
+    struct stat st;
+    
+    get_dir_path(ffrom, from);
+    if (lstat(ffrom, &st) == 0 && S_ISDIR(st.st_mode)) {
+        get_dir_path(fto, to); 
+    } else {
+        get_file_path(ffrom, from); 
+        get_file_path(fto, to);
+    }
+
+    int res = rename(ffrom, fto);
+    if (res == -1) return -errno;
+    return 0;
+}
+
+static int xmp_utimens(const char *path, const struct timespec ts[2]) {
+    char fpath[1024];
+    struct stat st;
+
+    get_dir_path(fpath, path);
+    if (lstat(fpath, &st) != 0) {
+        get_file_path(fpath, path);
+    }
+
+    struct timeval tv[2];
+    tv[0].tv_sec = ts[0].tv_sec;
+    tv[0].tv_usec = ts[0].tv_nsec / 1000;
+    tv[1].tv_sec = ts[1].tv_sec;
+    tv[1].tv_usec = ts[1].tv_nsec / 1000;
+
+    int res = utimes(fpath, tv);
+    if (res == -1) return -errno;
+    return 0;
+}
+```
+
+Untuk memodifikasi entitas dan metadatanya, kedua program ini menerapkan deteksi target secara adaptif. Pada kode `xmp_rename`, program memanfaatkan `lstat` untuk memeriksa sumber; direktori akan dipetakan secara normal, sedangkan target berupa file akan otomatis disisipkan ekstensi `.enc` pada path asal dan tujuan sebelum system call `rename()` dieksekusi. Sementara itu, operasi pembaruan waktu (`xmp_utimens`) menggunakan pengujian path serupa untuk menemukan lokasi fisiknya. Poin krusial pada operasi I/O ini terletak pada konversi resolusi waktu; struktur data FUSE yang berpresisi nanodetik (`timespec`) wajib dibagi 1000 untuk ditransformasi menjadi format mikrodetik (`timeval`) agar pembaruan metadata dapat diproses dengan valid oleh system call `utimes()`. Dan yang terakhir:
+
+```c
+static struct fuse_operations xmp_oper = {
+    .getattr  = xmp_getattr,
+    .readdir  = xmp_readdir,
+    .mkdir    = xmp_mkdir,
+    .rmdir    = xmp_rmdir,
+    .create   = xmp_create,
+    .open     = xmp_open,
+    .read     = xmp_read,
+    .write    = xmp_write,
+    .truncate = xmp_truncate,
+    .unlink   = xmp_unlink,
+    .access   = xmp_access,
+    .rename   = xmp_rename,
+    .utimens  = xmp_utimens, 
+};
+
+int main(int argc, char *argv[]) {
+    char cwd[1024];
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+        perror("getcwd() error");
+        return 1;
+    }
+
+    snprintf(source_dir, sizeof(source_dir), "%s/encrypted_storage", cwd);
+    mkdir(source_dir, 0777); 
+
+    char mount_dir[1024];
+    snprintf(mount_dir, sizeof(mount_dir), "%s/fuse_mount", cwd);
+    mkdir(mount_dir, 0777); 
+
+    char *fuse_argv[] = { argv[0], mount_dir };
+    int fuse_argc = 2;
+
+    return fuse_main(fuse_argc, fuse_argv, &xmp_oper, NULL);
+}
+```
+
+Bagian ini terdiri dari dua komponen konfigurasi utama. Struktur `fuse_operations` bertindak sebagai tabel pemetaan (_dispatch table_) esensial yang meregistrasikan seluruh rutinitas kustom—mulai dari manajemen I/O hingga modifikasi metadata agar dapat dikenali dan dieksekusi secara dinamis oleh library FUSE. Sementara itu, fungsi main mengambil alih inisiasi lingkungan secara otomatis. Alih-alih bergantung pada argumen manual pengguna, program secara mandiri mendeteksi direktori kerja aktif (`getcwd`) untuk membangun direktori sumber (`encrypted_storage`) beserta titik kaitnya (`fuse_mount`) melalui system call `mkdir`. Setelah infrastruktur folder dipastikan siap, siklus hidup program diserahkan sepenuhnya kepada `fuse_main` untuk menjalankan daemon sistem berkas di latar belakang berbekal tabel pemetaan yang telah dikonfigurasi.
+
+**Dockerfile
+
+Untuk program Dockerfilenya sendiri seperti ini:
+
+```Dockerfile
+FROM ubuntu:latest
+
+WORKDIR /app
+
+COPY server /app/
+
+EXPOSE 9000
+
+CMD ["./server"]
+```
+
+Ini adalah setupun untuk docker. Pertama adalah menentukan perangkat sandbox terlebih dahulu. Dalam soal diminta `ubuntu:latest` yang artinya sandboxnya harus ubuntu terbaru. Selanjutnya `WORKDIR` yang menuju ke app. Nah workdir ini sendiri adlaah command untuk working directorynya. Lalu `COPY` adalah perintah mengcopy file server ke dalam file `/app/` ini. Selanjutnya `EXPOSE` adalah port yang ke ngeexpose port berapa. Dalam konteks ini, port yang harus di expose adalah 9000. Dan terakhir `CMD` adalah command untuk menjalankan filenya.
+
+**client.c**
+
+Untuk kode programnya:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+
+#define PORT 9000
+#define BUFFER_SIZE 1024
+```
+
+Adalah program setup-an awalnya dengan mendefinisikan portnya 9000 dan buffer_sizenya 1024. Selanjutnya:
+
+```c
+int main() {
+    int sock = 0;
+    struct sockaddr_in serv_addr;
+    char buffer[BUFFER_SIZE] = {0};
+    char command[BUFFER_SIZE];
+
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        printf("\n Socket creation error \n");
+        return -1;
+    }
+
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(PORT);
+
+    if (inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr) <= 0) {
+        printf("\nInvalid address/ Address not supported \n");
+        return -1;
+    }
+
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        printf("\nConnection Failed. Pastikan Docker server sudah jalan! \n");
+        return -1;
+    }
+
+    printf("Connected to DB Server on port %d\n", PORT);
+    printf("Type HELP for available commands\n");
+    printf("Type EXIT to quit\n");
+
+    while (1) {
+        printf("\ndb > ");
+        fgets(command, BUFFER_SIZE, stdin);
+        command[strcspn(command, "\n")] = 0; 
+
+        if (strcmp(command, "EXIT") == 0) {
+            break;
+        }
+
+        send(sock, command, strlen(command), 0);
+        
+        memset(buffer, 0, BUFFER_SIZE);
+        int valread = read(sock, buffer, BUFFER_SIZE);
+        if (valread > 0) {
+            printf("%s\n", buffer);
+        }
+    }
+
+    close(sock);
+    return 0;
+}
+```
+
+Nah pada kode main ini sebagai aspek komunikasi antar-proses (IPC), blok kode ini mengimplementasikan aplikasi klien berbasis socket TCP/IP yang bertindak sebagai antarmuka interaktif menuju database server. Fase inisiasi dimulai dengan pembentukan socket berjenis `SOCK_STREAM` (TCP) yang dikonfigurasi untuk menyambung ke antarmuka localhost (`127.0.0.1`). Transformasi alamat IP dari format teks menjadi bentuk biner ditangani secara aman oleh utilitas `inet_pton`, sebelum system call `connect()` memicu prosedur Three-Way Handshake untuk membangun sesi komunikasi yang reliabel dengan server.
+
+Setelah koneksi terjalin, alur eksekusi bertransisi ke dalam siklus looping tak terbatas (CLI mandiri). Pada fase ini, program menangkap instruksi pengguna melalui `fgets`, mensterilkan karakter newline bawaannya, dan mentransmisikan payload tersebut ke server via perintah `send()`. Siklus ini akan langsung tertahan (blocking) pada operasi `read()` untuk menunggu dan mencetak respons balik dari server ke layar terminal. Interaksi dua arah ini akan terus berlangsung hingga pengguna memberikan interupsi berupa perintah 'EXIT', yang secara elegan akan menghentikan perulangan dan membebaskan sumber daya jaringan melalui rutinitas `close()`.
+
+#### output
+
+1. Mengambil file dari gdrive yang diberikan
+
+![alt text](/assets/soal_2/mengambil%20file.png)
+
+2. Compile `fuse.c`, `client.c` dan build Dockerfilenya
+
+![alt text](/assets/soal_2/build%20docker%20and%20compile%20file%20c.png)
+
+3. Menjalankan fusenya
+
+![alt text](/assets/soal_2/jalanin%20fuse.png)
+
+4. Mencoba membuat file txt dan menghapus semua filenya
+
+![alt text](/assets/soal_2/percobaan%20file.png)
+
+5. Membandingkan isi file pada folder `fuse_mount` dan `encrypted_storage`
+
+![alt text](/assets/soal_2/encrypt-file.png)
+
+6. Check list docker images
+
+![alt text](/assets/soal_2/Docker%20images.png)
+
+7. Membuat database dan tabelnya dan menunjukkan hasilnya
+
+![alt text](/assets/soal_2/Docker.png)
+
+#### Kendala
+
+Kendalanya: berantem sama command docker yang tidak nembus ke encrypted_storage dan fuse_mount :>. Selain itu kendala dalam encrypt karena dalam contohnya ada tanda belah ketupa + `?` sedangkan punya saya hanya `v`. Itu saja
+
+#### Klarifikasi
+
+Jika dalam video no 2 itu tidak bisa automatic bikin foldernya, itu salah saya sendiri karena tidak melihat `mkdir` dalam soalnya. Itu saja
+
+### Soal 3
+
+#### Penjelasan
+
+**<nama-file>.<format-file>**
+
+Apa aja deh bebas wokk. Sesuaikan format dengan file yang dibutuhkan dengan soal juga
+
+```<kode-program>
+
+<!-- Kode programnya -->
+```
+
+#### output
+
+<!-- <isinya gambar dari hasil yang sesuai> -->
+
+contoh:
+
+1. Rua rua
+
+`![alt text](<source-nya>)`
+
+#### Kendala
+
+<!-- Isi kendalanya dimana -->
